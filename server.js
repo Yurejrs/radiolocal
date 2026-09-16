@@ -16,6 +16,7 @@ const PORT = Number(process.env.PORT || 3000);
 const HOST = process.env.HOST || '0.0.0.0';
 const startedAt = Date.now();
 const history = { music: [], ad: [] };
+const AUDIO_EXTENSIONS = new Set(['.mp3', '.wav', '.m4a', '.ogg', '.aac', '.flac']);
 
 fs.mkdirSync(AUDIO_DIR, { recursive: true });
 const db = new Database(DB_PATH);
@@ -61,6 +62,13 @@ function safeName(value) {
   return value.normalize('NFKD').replace(/[\u0300-\u036f]/g, '').replace(/[^a-zA-Z0-9._-]+/g, '-').replace(/^-+|-+$/g, '') || 'audio';
 }
 function titleFrom(filename) { return path.basename(filename, path.extname(filename)).replace(/[_-]+/g, ' ').replace(/\s+/g, ' ').trim() || 'Áudio sem título'; }
+function validateUploadFile(file) {
+  const filename = String(file.filename || '').trim();
+  const ext = path.extname(filename).toLowerCase();
+  if (!filename) throw new Error('O arquivo não possui um nome válido.');
+  if (!AUDIO_EXTENSIONS.has(ext)) throw new Error(`Formato não suportado (${ext || 'sem extensão'}).`);
+  if (!file.buffer?.length) throw new Error('O arquivo está vazio.');
+}
 function ffmpeg(input, output) {
   return new Promise((resolve, reject) => {
     const child = spawn(process.env.FFMPEG_BIN || 'ffmpeg', ['-y', '-i', input, '-af', 'loudnorm=I=-14:TP=-1:LRA=11', '-ar', '44100', '-ac', '2', '-c:a', 'libmp3lame', '-b:a', '128k', output], { stdio: ['ignore', 'ignore', 'pipe'] });
@@ -100,12 +108,23 @@ function chooseNext(type) {
 function normalizeTrack(row) { return row ? { ...row, url: `/audio/${encodeURIComponent(path.basename(row.file_path))}` } : row; }
 
 const app = Fastify({ logger: process.env.NODE_ENV !== 'test' });
-app.register(multipart, { limits: { fileSize: 250 * 1024 * 1024, files: 1 } });
+app.register(multipart, { limits: { fileSize: 250 * 1024 * 1024, files: 20 } });
 app.register(fastifyStatic, { root: path.join(ROOT, 'public'), prefix: '/' });
 app.register(fastifyStatic, { root: AUDIO_DIR, prefix: '/audio/', decorateReply: false });
 
 app.get('/api/health', async () => ({ ok: true, service: 'radiostore' }));
 app.get('/api/tracks', async () => db.prepare(`SELECT t.*, c.name AS category_name, c.priority_weight FROM tracks t LEFT JOIN categories c ON c.id=t.category_id ORDER BY t.created_at DESC`).all().map(normalizeTrack));
+app.delete('/api/tracks/:id', async (request, reply) => {
+  const id = Number(request.params.id);
+  if (!Number.isInteger(id) || id < 1) return reply.code(400).send({ error: 'Identificador de faixa inválido.' });
+  const track = db.prepare('SELECT id, file_path FROM tracks WHERE id=?').get(id);
+  if (!track) return reply.code(404).send({ error: 'Faixa não encontrada.' });
+  const remove = db.transaction(() => { db.prepare('DELETE FROM playback_history WHERE track_id=?').run(id); db.prepare('DELETE FROM tracks WHERE id=?').run(id); });
+  remove();
+  await fsp.rm(track.file_path, { force: true });
+  history.music = history.music.filter(item => item !== id); history.ad = history.ad.filter(item => item !== id);
+  return reply.code(204).send();
+});
 app.get('/api/categories', async () => db.prepare('SELECT * FROM categories ORDER BY type, priority_weight DESC').all());
 app.get('/api/history', async () => db.prepare(`SELECT h.played_at, t.id, t.title, t.artist, t.type, c.name AS category_name FROM playback_history h JOIN tracks t ON t.id=h.track_id LEFT JOIN categories c ON c.id=t.category_id ORDER BY h.id DESC LIMIT 12`).all());
 app.get('/api/settings', async () => ({ music_before_ad: Number(setting('music_before_ad') || 3), uptime_seconds: Math.floor((Date.now() - startedAt) / 1000) }));
@@ -124,20 +143,33 @@ app.get('/api/queue/next', async (request, reply) => {
   return { track: normalizeTrack(track), type, played_music: playedMusic, music_before_ad: musicBeforeAd };
 });
 app.post('/api/upload', async (request, reply) => {
-  const fields = {}; let filePart; let fileBuffer;
-  for await (const part of request.parts()) {
-    if (part.type === 'file') { filePart = part; fileBuffer = await part.toBuffer(); }
-    else fields[part.fieldname] = part.value;
-  }
-  if (!filePart?.filename || !fileBuffer) return reply.code(400).send({ error: 'Envie um arquivo de áudio.' });
-  const type = fields.type === 'ad' ? 'ad' : 'music';
-  const ext = '.mp3'; const id = `${Date.now()}-${crypto.randomBytes(4).toString('hex')}`; const raw = path.join(AUDIO_DIR, `${id}-raw-${safeName(filePart.filename)}`); const output = path.join(AUDIO_DIR, `${id}${ext}`);
+  const fields = {}; const files = [];
   try {
-    await fsp.writeFile(raw, fileBuffer); await ffmpeg(raw, output); const duration = await probeDuration(output); await fsp.rm(raw, { force: true });
-    const category = fields.category_id ? db.prepare('SELECT id FROM categories WHERE id=? AND type=?').get(Number(fields.category_id), type) : db.prepare('SELECT id FROM categories WHERE type=? ORDER BY id LIMIT 1').get(type);
-    const info = db.prepare('INSERT INTO tracks (title,artist,file_path,duration,type,category_id) VALUES (?,?,?,?,?,?)').run(fields.title?.trim() || titleFrom(filePart.filename), fields.artist?.trim() || 'Artista desconhecido', output, duration, type, category?.id || null);
-    return reply.code(201).send({ track: normalizeTrack(db.prepare('SELECT * FROM tracks WHERE id=?').get(info.lastInsertRowid)) });
-  } catch (error) { await fsp.rm(raw, { force: true }); await fsp.rm(output, { force: true }); return reply.code(422).send({ error: `Não foi possível processar o áudio: ${error.message}` }); }
+    for await (const part of request.parts()) {
+      if (part.type === 'file') files.push({ filename: part.filename, buffer: await part.toBuffer() });
+      else fields[part.fieldname] = part.value;
+    }
+  } catch (error) {
+    request.log.warn({ err: error }, 'Upload interrompido antes de concluir o lote');
+    return reply.code(400).send({ error: 'O envio foi interrompido antes de concluir o lote. Tente novamente.' });
+  }
+  if (!files.length) return reply.code(400).send({ error: 'Envie pelo menos um arquivo de áudio.' });
+  if (fields.type && !['music', 'ad'].includes(fields.type)) return reply.code(400).send({ error: 'Tipo de upload inválido.' });
+  const type = fields.type === 'ad' ? 'ad' : 'music';
+  const processed = [];
+  const errors = [];
+  for (const file of files) {
+    const ext = '.mp3'; const id = `${Date.now()}-${crypto.randomBytes(4).toString('hex')}`; const raw = path.join(AUDIO_DIR, `${id}-raw-${safeName(file.filename)}`); const output = path.join(AUDIO_DIR, `${id}${ext}`);
+    try {
+      validateUploadFile(file);
+      await fsp.writeFile(raw, file.buffer); await ffmpeg(raw, output); const duration = await probeDuration(output); await fsp.rm(raw, { force: true });
+      const category = fields.category_id ? db.prepare('SELECT id FROM categories WHERE id=? AND type=?').get(Number(fields.category_id), type) : db.prepare('SELECT id FROM categories WHERE type=? ORDER BY id LIMIT 1').get(type);
+      const info = db.prepare('INSERT INTO tracks (title,artist,file_path,duration,type,category_id) VALUES (?,?,?,?,?,?)').run(fields.title?.trim() || titleFrom(file.filename), fields.artist?.trim() || 'Artista desconhecido', output, duration, type, category?.id || null);
+      processed.push(normalizeTrack(db.prepare('SELECT * FROM tracks WHERE id=?').get(info.lastInsertRowid)));
+    } catch (error) { await fsp.rm(raw, { force: true }); await fsp.rm(output, { force: true }); errors.push({ filename: file.filename, error: `Não foi possível processar ${file.filename}: ${error.message}` }); }
+  }
+  if (errors.length && !processed.length) return reply.code(422).send({ error: errors[0].error, errors });
+  return reply.code(errors.length ? 207 : 201).send({ tracks: processed, track: processed[0], errors });
 });
 
 if (require.main === module) app.listen({ port: PORT, host: HOST }).catch(error => { app.log.error(error); process.exit(1); });
