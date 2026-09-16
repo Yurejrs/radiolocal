@@ -69,6 +69,14 @@ function validateUploadFile(file) {
   if (!AUDIO_EXTENSIONS.has(ext)) throw new Error(`Formato não suportado (${ext || 'sem extensão'}).`);
   if (!file.buffer?.length) throw new Error('O arquivo está vazio.');
 }
+function categoryPayload(body) {
+  const name = String(body?.name || '').trim();
+  const priority = Number(body?.priority_weight);
+  if (!name) throw new Error('Informe um nome para a categoria.');
+  if (name.length > 60) throw new Error('O nome da categoria deve ter no máximo 60 caracteres.');
+  if (!Number.isInteger(priority) || priority < 0 || priority > 100) throw new Error('A prioridade deve ser um inteiro entre 0 e 100.');
+  return { name, priority };
+}
 function ffmpeg(input, output) {
   return new Promise((resolve, reject) => {
     const child = spawn(process.env.FFMPEG_BIN || 'ffmpeg', ['-y', '-i', input, '-af', 'loudnorm=I=-14:TP=-1:LRA=11', '-ar', '44100', '-ac', '2', '-c:a', 'libmp3lame', '-b:a', '128k', output], { stdio: ['ignore', 'ignore', 'pipe'] });
@@ -125,7 +133,43 @@ app.delete('/api/tracks/:id', async (request, reply) => {
   history.music = history.music.filter(item => item !== id); history.ad = history.ad.filter(item => item !== id);
   return reply.code(204).send();
 });
-app.get('/api/categories', async () => db.prepare('SELECT * FROM categories ORDER BY type, priority_weight DESC').all());
+app.get('/api/categories', async () => db.prepare(`SELECT c.*, COUNT(t.id) AS track_count FROM categories c LEFT JOIN tracks t ON t.category_id=c.id GROUP BY c.id ORDER BY c.type, c.priority_weight DESC, c.name COLLATE NOCASE`).all());
+app.post('/api/categories', async (request, reply) => {
+  let payload; try { payload = categoryPayload(request.body); } catch (error) { return reply.code(400).send({ error: error.message }); }
+  if (db.prepare('SELECT id FROM categories WHERE type=? AND name COLLATE NOCASE=?').get('ad', payload.name)) return reply.code(409).send({ error: 'Já existe uma categoria de anúncio com esse nome.' });
+  const result = db.prepare('INSERT INTO categories (name,type,priority_weight) VALUES (?,\'ad\',?)').run(payload.name, payload.priority);
+  return reply.code(201).send(db.prepare('SELECT *, 0 AS track_count FROM categories WHERE id=?').get(result.lastInsertRowid));
+});
+app.put('/api/categories/:id', async (request, reply) => {
+  const id = Number(request.params.id); const category = db.prepare('SELECT * FROM categories WHERE id=?').get(id);
+  if (!Number.isInteger(id) || !category || category.type !== 'ad') return reply.code(404).send({ error: 'Categoria de anúncio não encontrada.' });
+  let payload; try { payload = categoryPayload(request.body); } catch (error) { return reply.code(400).send({ error: error.message }); }
+  if (db.prepare('SELECT id FROM categories WHERE type=? AND name COLLATE NOCASE=? AND id<>?').get('ad', payload.name, id)) return reply.code(409).send({ error: 'Já existe uma categoria de anúncio com esse nome.' });
+  db.prepare('UPDATE categories SET name=?, priority_weight=? WHERE id=?').run(payload.name, payload.priority, id);
+  return db.prepare('SELECT c.*, COUNT(t.id) AS track_count FROM categories c LEFT JOIN tracks t ON t.category_id=c.id WHERE c.id=? GROUP BY c.id').get(id);
+});
+app.delete('/api/categories/:id', async (request, reply) => {
+  const id = Number(request.params.id); const category = db.prepare('SELECT * FROM categories WHERE id=?').get(id);
+  if (!Number.isInteger(id) || !category || category.type !== 'ad') return reply.code(404).send({ error: 'Categoria de anúncio não encontrada.' });
+  const count = db.prepare('SELECT COUNT(*) AS n FROM tracks WHERE category_id=?').get(id).n;
+  if (count) return reply.code(409).send({ error: `Não é possível excluir “${category.name}”: ${count} anúncio(s) ainda estão associados. Mova-os antes de excluir.` });
+  if (db.prepare('SELECT COUNT(*) AS n FROM categories WHERE type=\'ad\'').get().n <= 1) return reply.code(409).send({ error: 'Mantenha pelo menos uma categoria de anúncio disponível.' });
+  db.prepare('DELETE FROM categories WHERE id=?').run(id); return reply.code(204).send();
+});
+app.put('/api/tracks/:id/category', async (request, reply) => {
+  const id = Number(request.params.id); const track = db.prepare('SELECT id,type FROM tracks WHERE id=?').get(id);
+  if (!Number.isInteger(id) || !track) return reply.code(404).send({ error: 'Faixa não encontrada.' });
+  if (track.type !== 'ad') return reply.code(400).send({ error: 'Somente anúncios podem ter categoria alterada.' });
+  const rawCategoryId = request.body?.category_id;
+  if (rawCategoryId === '' || rawCategoryId === null || rawCategoryId === undefined) {
+    db.prepare('UPDATE tracks SET category_id=NULL WHERE id=?').run(id);
+  } else {
+    const categoryId = Number(rawCategoryId); const category = db.prepare('SELECT id FROM categories WHERE id=? AND type=\'ad\'').get(categoryId);
+    if (!category) return reply.code(400).send({ error: 'Categoria de anúncio inválida.' });
+    db.prepare('UPDATE tracks SET category_id=? WHERE id=?').run(categoryId, id);
+  }
+  return normalizeTrack(db.prepare(`SELECT t.*, c.name AS category_name, c.priority_weight FROM tracks t LEFT JOIN categories c ON c.id=t.category_id WHERE t.id=?`).get(id));
+});
 app.get('/api/history', async () => db.prepare(`SELECT h.played_at, t.id, t.title, t.artist, t.type, c.name AS category_name FROM playback_history h JOIN tracks t ON t.id=h.track_id LEFT JOIN categories c ON c.id=t.category_id ORDER BY h.id DESC LIMIT 12`).all());
 app.get('/api/settings', async () => ({ music_before_ad: Number(setting('music_before_ad') || 3), uptime_seconds: Math.floor((Date.now() - startedAt) / 1000) }));
 app.put('/api/settings', async (request, reply) => {

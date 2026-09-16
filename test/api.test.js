@@ -37,3 +37,23 @@ test('upload aceita múltiplos arquivos e reporta falhas parciais', async () => 
     assert.equal(partialResponse.status, 207); assert.equal(partialData.tracks.length, 1); assert.equal(partialData.errors.length, 1); assert.match(partialData.errors[0].filename, /invalido/);
   } finally { child.kill('SIGTERM'); }
 });
+
+test('categorias de anúncios têm CRUD e associação protegida', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'radiostore-categories-')); const port = 3189;
+  const child = spawn(process.execPath, ['server.js'], { cwd: path.join(__dirname, '..'), env: { ...process.env, NODE_ENV: 'test', PORT: String(port), RADIO_DATA_DIR: dir }, stdio: 'ignore' });
+  const base = `http://127.0.0.1:${port}`;
+  try {
+    await waitForHealth(port);
+    const create = await fetch(`${base}/api/categories`, { method:'POST', headers:{'content-type':'application/json'}, body:JSON.stringify({ name:'Institucional', priority_weight:35 }) });
+    assert.equal(create.status, 201); const category = await create.json(); assert.equal(category.name, 'Institucional'); assert.equal(category.track_count, 0);
+    const duplicate = await fetch(`${base}/api/categories`, { method:'POST', headers:{'content-type':'application/json'}, body:JSON.stringify({ name:'institucional', priority_weight:20 }) }); assert.equal(duplicate.status, 409);
+    const update = await fetch(`${base}/api/categories/${category.id}`, { method:'PUT', headers:{'content-type':'application/json'}, body:JSON.stringify({ name:'Institucional e serviços', priority_weight:45 }) }); assert.equal(update.status, 200); assert.equal((await update.json()).priority_weight, 45);
+    const body = new FormData(); body.append('file', new Blob([wavFixture(500)], {type:'audio/wav'}), 'anuncio.wav'); body.append('type','ad'); body.append('category_id',String(category.id));
+    const upload = await fetch(`${base}/api/upload`, {method:'POST', body}); assert.equal(upload.status, 201); const track = (await upload.json()).track;
+    const categories = await (await fetch(`${base}/api/categories`)).json(); assert.equal(categories.find(item=>item.id===category.id).track_count, 1);
+    const blocked = await fetch(`${base}/api/categories/${category.id}`, {method:'DELETE'}); assert.equal(blocked.status, 409);
+    const unassign = await fetch(`${base}/api/tracks/${track.id}/category`, {method:'PUT',headers:{'content-type':'application/json'},body:JSON.stringify({category_id:''})}); const unassigned = await unassign.json(); assert.equal(unassign.status, 200); assert.equal(unassigned.category_id, null); assert.match(unassigned.url, /^\/audio\//);
+    const musicBody = new FormData(); musicBody.append('file', new Blob([wavFixture(700)], {type:'audio/wav'}), 'musica.wav'); musicBody.append('type','music'); const musicUpload = await fetch(`${base}/api/upload`, {method:'POST',body:musicBody}); const musicTrack = (await musicUpload.json()).track;
+    const invalidMusicAssociation = await fetch(`${base}/api/tracks/${musicTrack.id}/category`, {method:'PUT',headers:{'content-type':'application/json'},body:JSON.stringify({category_id:category.id})}); assert.equal(invalidMusicAssociation.status, 400);
+  } finally { child.kill('SIGTERM'); }
+});
