@@ -1,0 +1,16 @@
+services:
+  radiostore:
+    build: .
+    ports:
+      - "3000:3000"
+    volumes:
+      - radiostore_data:/app/data
+    environment:
+      NODE_ENV: production
+      PORT: 3000
+      RADIO_DATA_DIR: /app/data
+    restart: unless-stopped
+    mem_limit: 150m
+    init: true
+volumes:
+  radiostore_data:
