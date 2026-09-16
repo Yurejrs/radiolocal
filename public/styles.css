@@ -110,6 +110,10 @@ input[type=range] { width:100%; accent-color:var(--purple); }
 .empty-icon svg { width:28px; color:#b2b5c3; }
 .toast { position:fixed; right:25px; bottom:25px; background:var(--ink); color:#fff; border-radius:10px; padding:13px 17px; transform:translateY(120px); transition:.3s; box-shadow:var(--shadow); z-index:7; }
 .toast.show { transform:translateY(0); }
+.logout-btn { display:inline-flex; align-items:center; gap:6px; border:1px solid var(--line); border-radius:9px; padding:8px 10px; background:var(--surface); color:var(--muted); font:inherit; font-size:11px; cursor:pointer; }
+.user-badge { color:var(--ink); background:var(--purple-soft); border-radius:9px; padding:8px 10px; font-size:11px; font-weight:700; }
+.logout-btn:hover,.logout-btn:focus-visible { color:var(--purple); border-color:#d8d2fa; outline:0; }
+.logout-btn svg { width:14px; height:14px; }
 #priority-bars { display:grid; gap:10px; margin-top:18px; }
 .priority-line { font-size:11px; }
 .priority-label { display:flex; justify-content:space-between; margin-bottom:5px; }

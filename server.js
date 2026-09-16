@@ -17,6 +17,11 @@ const HOST = process.env.HOST || '0.0.0.0';
 const startedAt = Date.now();
 const history = { music: [], ad: [] };
 const AUDIO_EXTENSIONS = new Set(['.mp3', '.wav', '.m4a', '.ogg', '.aac', '.flac']);
+const SESSION_COOKIE = 'radiostore_session';
+const SESSION_TTL_MS = 8 * 60 * 60 * 1000;
+const LOGIN_WINDOW_MS = 15 * 60 * 1000;
+const LOGIN_MAX_ATTEMPTS = 8;
+const loginAttempts = new Map();
 
 fs.mkdirSync(AUDIO_DIR, { recursive: true });
 const db = new Database(DB_PATH);
@@ -46,7 +51,23 @@ db.exec(`
     played_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY(track_id) REFERENCES tracks(id)
   );
+  CREATE TABLE IF NOT EXISTS auth_users (
+    id INTEGER PRIMARY KEY CHECK(id = 1),
+    username TEXT NOT NULL UNIQUE,
+    password_hash TEXT NOT NULL,
+    password_salt TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+  );
+  CREATE TABLE IF NOT EXISTS auth_sessions (
+    token_hash TEXT PRIMARY KEY,
+    username TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    last_seen_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL
+  );
 `);
+db.prepare("UPDATE auth_users SET username='radio' WHERE id=1 AND username='admin'").run();
 
 const seed = db.prepare('INSERT INTO categories (name, type, priority_weight) VALUES (?, ?, ?)');
 const count = db.prepare('SELECT COUNT(*) AS n FROM categories').get().n;
@@ -115,12 +136,99 @@ function chooseNext(type) {
 }
 function normalizeTrack(row) { return row ? { ...row, url: `/audio/${encodeURIComponent(path.basename(row.file_path))}` } : row; }
 
+function hashSessionToken(token) { return crypto.createHash('sha256').update(token).digest('hex'); }
+function passwordHash(password, salt) {
+  return new Promise((resolve, reject) => crypto.scrypt(password, salt, 64, (error, derived) => error ? reject(error) : resolve(derived.toString('hex'))));
+}
+async function makePasswordRecord(password) {
+  const salt = crypto.randomBytes(16).toString('hex');
+  return { salt, hash: await passwordHash(password, salt) };
+}
+function validPassword(password) { return typeof password === 'string' && password.length >= 8 && password.length <= 200; }
+function authConfigured() { return Boolean(db.prepare('SELECT id FROM auth_users WHERE id=1').get()); }
+function cookieValue(request) {
+  const cookies = String(request.headers.cookie || '').split(';').map(item => item.trim());
+  const entry = cookies.find(item => item.startsWith(`${SESSION_COOKIE}=`));
+  return entry ? decodeURIComponent(entry.slice(SESSION_COOKIE.length + 1)) : '';
+}
+function currentUser(request) {
+  const token = cookieValue(request); if (!token) return null;
+  const now = new Date();
+  const session = db.prepare('SELECT username, expires_at FROM auth_sessions WHERE token_hash=?').get(hashSessionToken(token));
+  if (!session || new Date(session.expires_at) <= now) {
+    if (session) db.prepare('DELETE FROM auth_sessions WHERE token_hash=?').run(hashSessionToken(token));
+    return null;
+  }
+  const expires = new Date(Date.now() + SESSION_TTL_MS).toISOString();
+  db.prepare('UPDATE auth_sessions SET last_seen_at=?, expires_at=? WHERE token_hash=?').run(now.toISOString(), expires, hashSessionToken(token));
+  return { username: session.username };
+}
+function setSessionCookie(reply, token, maxAge = SESSION_TTL_MS / 1000) {
+  reply.header('set-cookie', `${SESSION_COOKIE}=${encodeURIComponent(token)}; Path=/; HttpOnly; SameSite=Strict; Max-Age=${Math.floor(maxAge)}`);
+}
+function clearSessionCookie(reply) { setSessionCookie(reply, '', 0); }
+function loginKey(request) { return request.ip || request.headers['x-forwarded-for'] || 'unknown'; }
+function loginBlocked(request) {
+  const entry = loginAttempts.get(loginKey(request));
+  if (!entry) return false;
+  if (entry.resetAt <= Date.now()) { loginAttempts.delete(loginKey(request)); return false; }
+  return entry.count >= LOGIN_MAX_ATTEMPTS;
+}
+function recordLoginFailure(request) {
+  const key = loginKey(request); const current = loginAttempts.get(key);
+  if (!current || current.resetAt <= Date.now()) loginAttempts.set(key, { count: 1, resetAt: Date.now() + LOGIN_WINDOW_MS });
+  else current.count += 1;
+}
+function clearLoginFailures(request) { loginAttempts.delete(loginKey(request)); }
+function publicPage(file) { return fs.createReadStream(path.join(ROOT, 'public', file)); }
+
 const app = Fastify({ logger: process.env.NODE_ENV !== 'test' });
 app.register(multipart, { limits: { fileSize: 250 * 1024 * 1024, files: 20 } });
+app.addHook('onRequest', async (request, reply) => {
+  const pathname = request.url.split('?')[0];
+  const publicApi = ['/api/health', '/api/auth/status', '/api/auth/setup', '/api/auth/login'];
+  const protectedPath = pathname.startsWith('/audio/') || (pathname.startsWith('/api/') && !publicApi.includes(pathname)) || pathname === '/index.html';
+  if (protectedPath && !currentUser(request)) {
+    if (pathname.startsWith('/api/') || pathname.startsWith('/audio/')) return reply.code(401).send({ error: 'Autenticação necessária.' });
+    return reply.redirect('/');
+  }
+});
+app.get('/', async (request, reply) => {
+  return reply.type('text/html').send(publicPage(currentUser(request) ? 'index.html' : 'login.html'));
+});
 app.register(fastifyStatic, { root: path.join(ROOT, 'public'), prefix: '/' });
 app.register(fastifyStatic, { root: AUDIO_DIR, prefix: '/audio/', decorateReply: false });
 
 app.get('/api/health', async () => ({ ok: true, service: 'radiostore' }));
+app.get('/api/auth/status', async request => ({ configured: authConfigured(), authenticated: Boolean(currentUser(request)), user: currentUser(request)?.username || null }));
+app.post('/api/auth/setup', async (request, reply) => {
+  if (authConfigured()) return reply.code(409).send({ error: 'A configuração inicial já foi concluída.' });
+  const password = request.body?.password; const confirmation = request.body?.confirmation;
+  if (!validPassword(password)) return reply.code(400).send({ error: 'A senha deve ter entre 8 e 200 caracteres.' });
+  if (password !== confirmation) return reply.code(400).send({ error: 'A confirmação da senha não confere.' });
+  const record = await makePasswordRecord(password);
+  db.prepare('INSERT INTO auth_users (id, username, password_hash, password_salt) VALUES (1,?,?,?)').run('radio', record.hash, record.salt);
+  return reply.code(201).send({ configured: true });
+});
+app.post('/api/auth/login', async (request, reply) => {
+  if (!authConfigured()) return reply.code(409).send({ error: 'Configure a senha de administrador antes de entrar.' });
+  if (loginBlocked(request)) return reply.code(429).send({ error: 'Muitas tentativas. Aguarde alguns minutos e tente novamente.' });
+  const username = String(request.body?.username || '').trim(); const password = request.body?.password;
+  const user = db.prepare('SELECT * FROM auth_users WHERE username=?').get(username);
+  const computedHash = user && validPassword(password) ? await passwordHash(password, user.password_salt) : '';
+  const storedBuffer = user ? Buffer.from(user.password_hash, 'hex') : Buffer.alloc(0);
+  const computedBuffer = Buffer.from(computedHash, 'hex');
+  const valid = Boolean(user && storedBuffer.length === computedBuffer.length && crypto.timingSafeEqual(storedBuffer, computedBuffer));
+  if (!valid) { recordLoginFailure(request); return reply.code(401).send({ error: 'Usuário ou senha inválidos.' }); }
+  clearLoginFailures(request);
+  const token = crypto.randomBytes(32).toString('base64url'); const now = new Date(); const expires = new Date(Date.now() + SESSION_TTL_MS);
+  db.prepare('INSERT INTO auth_sessions (token_hash, username, last_seen_at, expires_at) VALUES (?,?,?,?)').run(hashSessionToken(token), user.username, now.toISOString(), expires.toISOString());
+  setSessionCookie(reply, token); return { authenticated: true, user: user.username };
+});
+app.post('/api/auth/logout', async (request, reply) => {
+  const token = cookieValue(request); if (token) db.prepare('DELETE FROM auth_sessions WHERE token_hash=?').run(hashSessionToken(token));
+  clearSessionCookie(reply); return { authenticated: false };
+});
 app.get('/api/tracks', async () => db.prepare(`SELECT t.*, c.name AS category_name, c.priority_weight FROM tracks t LEFT JOIN categories c ON c.id=t.category_id ORDER BY t.created_at DESC`).all().map(normalizeTrack));
 app.delete('/api/tracks/:id', async (request, reply) => {
   const id = Number(request.params.id);

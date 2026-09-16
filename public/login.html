@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="theme-color" content="#f5f7fb">
+  <title>Entrar · RadioStore</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='18' fill='%236c5ce7'/%3E%3Ccircle cx='31' cy='34' r='18' fill='%231b1830'/%3E%3Ccircle cx='31' cy='34' r='7' fill='%23ff7675'/%3E%3Cpath d='M42 18 34 27' stroke='white' stroke-width='4' stroke-linecap='round'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="/styles.css">
+  <link rel="stylesheet" href="/auth.css">
+</head>
+<body class="auth-page">
+  <main class="auth-shell">
+    <section class="auth-card" aria-labelledby="auth-title">
+      <div class="auth-brand"><span class="brand-icon" data-icon="radio"></span><span class="brand-name">Radio<span>Store</span></span></div>
+      <div id="auth-content" class="auth-content" aria-live="polite">
+        <p class="eyebrow">PAINEL RESTRITO</p>
+        <h1 id="auth-title">Entrar na rádio</h1>
+        <p class="auth-description">Use o acesso do operador para gerenciar a programação local.</p>
+        <form id="login-form" class="auth-form">
+          <label>Usuário<input id="username" autocomplete="username" value="radio" required></label>
+          <label>Senha<input id="password" type="password" autocomplete="current-password" required></label>
+          <button class="primary-btn" type="submit">Entrar</button>
+          <p id="auth-error" class="auth-error" role="alert"></p>
+        </form>
+      </div>
+    </section>
+    <p class="auth-footer">Acesso disponível somente para operadores autorizados.</p>
+  </main>
+  <script src="/login.js"></script>
+</body>
+</html>
