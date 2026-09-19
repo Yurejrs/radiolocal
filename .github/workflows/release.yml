@@ -1,0 +1,55 @@
+name: Publicar release
+
+on:
+  push:
+    tags:
+      - "beta-v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Baixar o codigo da tag
+        uses: actions/checkout@v4
+
+      - name: Validar arquivos obrigatorios
+        shell: bash
+        run: |
+          set -euo pipefail
+          required=(
+            README.md
+            Dockerfile
+            docker-compose.yml
+            package.json
+            package-lock.json
+            server.js
+            scripts/install.ps1
+            scripts/reset-password.js
+            public/index.html
+          )
+          for file in "${required[@]}"; do
+            test -f "$file" || { echo "Arquivo obrigatorio ausente: $file" >&2; exit 1; }
+          done
+
+      - name: Montar ZIP de instalacao
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME}"
+          package_dir="RadioStore-${version}"
+          mkdir -p "dist/${package_dir}"
+          git archive --format=tar HEAD | tar -x -C "dist/${package_dir}"
+          (cd dist && zip -qr "${package_dir}.zip" "${package_dir}")
+          sha256sum "dist/${package_dir}.zip" > "dist/${package_dir}.zip.sha256"
+
+      - name: Publicar arquivos da release
+        uses: softprops/action-gh-release@v2
+        with:
+          prerelease: true
+          generate_release_notes: true
+          files: |
+            dist/*.zip
+            dist/*.sha256

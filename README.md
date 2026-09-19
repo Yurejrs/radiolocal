@@ -17,9 +17,8 @@ RadioStore é uma rádio indoor local para supermercados e outros ambientes come
 
 ## Requisitos
 
-- Node.js 20 ou superior.
-- FFmpeg e FFprobe instalados para execução fora do Docker.
-- Docker e Docker Compose para execução containerizada.
+- Para Docker: Docker Desktop (Windows) ou Docker com o plugin Compose.
+- Para execução sem Docker: Node.js 20 ou superior, FFmpeg e FFprobe.
 
 ## Execução local
 
@@ -44,6 +43,19 @@ npm run dev
 ```
 
 ## Execução com Docker
+
+### Windows (instalação recomendada)
+
+Baixe e extraia o arquivo `RadioStore-beta-vX.Y.Z.zip` anexado à release. Com o Docker Desktop aberto, execute o PowerShell na pasta extraída:
+
+```powershell
+Set-ExecutionPolicy -Scope Process Bypass
+.\scripts\install.ps1
+```
+
+O instalador valida o pacote, constrói o container, aguarda o serviço responder e abre o RadioStore no navegador. O Node.js e o FFmpeg não precisam ser instalados no Windows nesse modo, pois já estão incluídos na imagem Docker.
+
+### Outros sistemas
 
 Suba o serviço em segundo plano:
 
@@ -171,3 +183,5 @@ beta-vX.Y.Z
 ```
 
 Versão atualmente publicada: `beta-v0.3.0`.
+
+Cada nova tag gera automaticamente um ZIP de instalação e seu arquivo de verificação SHA-256. A publicação é interrompida se algum arquivo necessário, inclusive `scripts/install.ps1`, estiver ausente.
